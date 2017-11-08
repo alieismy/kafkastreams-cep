@@ -17,21 +17,27 @@
 package com.github.fhuss.kafka.streams.cep.demo;
 
 import com.github.fhuss.kafka.streams.cep.CEPStream;
+import com.github.fhuss.kafka.streams.cep.ComplexStreamsBuilder;
 import com.github.fhuss.kafka.streams.cep.Sequence;
 import com.github.fhuss.kafka.streams.cep.pattern.Pattern;
 import com.github.fhuss.kafka.streams.cep.pattern.QueryBuilder;
+import com.github.fhuss.kafka.streams.cep.processor.CEPProcessor;
+import com.github.fhuss.kafka.streams.cep.state.CEPStoreBuilders;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.KafkaStreams;
 import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.Topology;
 import org.apache.kafka.streams.kstream.KStream;
-import org.apache.kafka.streams.kstream.KStreamBuilder;
+import org.apache.kafka.streams.kstream.Printed;
+import org.apache.kafka.streams.kstream.Produced;
 import org.json.simple.JSONArray;
 import org.json.simple.JSONObject;
 
 import java.util.Collections;
 import java.util.List;
 import java.util.Properties;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -42,15 +48,14 @@ public class CEPStockKStreamsDemo {
         Properties props = new Properties();
         props.put(StreamsConfig.APPLICATION_ID_CONFIG, "streams-cep");
         props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
-        props.put(StreamsConfig.ZOOKEEPER_CONNECT_CONFIG, "localhost:2181");
-        props.put(StreamsConfig.KEY_SERDE_CLASS_CONFIG, StockEventSerDe.class);
-        props.put(StreamsConfig.VALUE_SERDE_CLASS_CONFIG, StockEventSerDe.class);
+        props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.StringSerde.class);
+        props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, StockEventSerDe.class);
 
         // setting offset reset to earliest so that we can re-run the demo code with the same pre-loaded data
-        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest");
 
         // build query
-        final Pattern<Object, StockEvent> pattern = new QueryBuilder<Object, StockEvent>()
+        final Pattern<String, StockEvent> pattern = new QueryBuilder<String, StockEvent>()
                 .select()
                     .where((k, v, ts, store) -> v.volume > 1000)
                     .<Long>fold("avg", (k, v, curr) -> v.price)
@@ -68,11 +73,10 @@ public class CEPStockKStreamsDemo {
                     .within(1, TimeUnit.HOURS)
                 .build();
 
-        KStreamBuilder builder = new KStreamBuilder();
+        ComplexStreamsBuilder builder = new ComplexStreamsBuilder();
 
-        CEPStream<Object, StockEvent> stream = new CEPStream<>(builder.stream("StockEvents"));
-
-        KStream<Object, Sequence<Object, StockEvent>> stocks = stream.query("Stocks", pattern);
+        CEPStream<String, StockEvent> stream = builder.stream("StockEvents");
+        KStream<String, Sequence<String, StockEvent>> stocks = stream.query("Stocks", pattern, Serdes.String(), new StockEventSerDe());
 
         stocks.mapValues(seq -> {
                   JSONObject json = new JSONObject();
@@ -81,17 +85,32 @@ public class CEPStockKStreamsDemo {
                       json.put(k, events);
                       List<String> collect = v.stream().map(e -> e.value.name).collect(Collectors.toList());
                       Collections.reverse(collect);
-                      collect.forEach(e -> events.add(e));
+                      collect.forEach(events::add);
                   });
                   return json.toJSONString();
               })
-              .through(null, Serdes.String(), "Matches")
-              .print();
+              .through("Matches", Produced.with(null, Serdes.String()))
+              .print(Printed.toSysOut());
 
+        KafkaStreams streams = new KafkaStreams(builder.build(), props);
 
-        //Use the topologyBuilder and streamingConfig to start the kafka streams process
-        KafkaStreams streaming = new KafkaStreams(builder, props);
-        //streaming.cleanUp();
-        streaming.start();
+        final CountDownLatch latch = new CountDownLatch(1);
+
+        // attach shutdown handler to catch control-c
+        Runtime.getRuntime().addShutdownHook(new Thread("streams-cep-shutdown-hook") {
+            @Override
+            public void run() {
+                streams.close();
+                latch.countDown();
+            }
+        });
+
+        try {
+            streams.start();
+            latch.await();
+        } catch (Throwable e) {
+            System.exit(1);
+        }
+        System.exit(0);
     }
 }
